@@ -84,6 +84,15 @@ export default function AISummarizer() {
       setPhase('thinking');
 
       const res = await fetch('/api/summarize', { method: 'POST', body: formData });
+      
+      // Safety check: ensure response is JSON
+      const contentType = res.headers.get("content-type");
+      if (!contentType || !contentType.includes("application/json")) {
+        const text = await res.text();
+        console.error("[AISummarizer] Non-JSON response:", text.slice(0, 500));
+        throw new Error("Something went wrong. Please try again.");
+      }
+
       const data = await res.json();
 
       if (!data.success) throw new Error(data.error ?? 'Summarization failed');

@@ -135,7 +135,7 @@ Be concise, professional, and focus on the most important information.`;
     const userPrompt = `Document: "${file.name}"\n\nContent:\n${extractedText.slice(0, 6000)}\n\nProvide a structured JSON summary.`;
 
     try {
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`, {
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash:generateContent?key=${geminiKey}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -154,10 +154,9 @@ Be concise, professional, and focus on the most important information.`;
       if (!response.ok) {
         const errorData = await response.text();
         console.error('[Summarize API] Gemini Service Error:', errorData);
-        let errorMessage = 'Gemini Service encountered a failure.';
-        if (response.status === 400 && errorData.includes('API key not valid')) errorMessage = 'Gemini API Error: Invalid API Key. Please verify .env.local configuration.';
-        else errorMessage = `Gemini API Error: ${response.status} ${response.statusText}`;
-        return NextResponse.json({ error: errorMessage }, { status: 502 });
+        let errorMessage = 'Something went wrong. Please try again.';
+        if (response.status === 400 && errorData.includes('API key not valid')) errorMessage = 'Invalid Gemini API Key. Please verify .env.local configuration.';
+        return NextResponse.json({ success: false, error: errorMessage }, { status: 502 });
       }
 
       const responseData = await response.json();
@@ -174,13 +173,15 @@ Be concise, professional, and focus on the most important information.`;
 
     } catch (apiError: any) {
       console.error('[Summarize API] Gemini Service Error:', apiError);
-      return NextResponse.json({ error: apiError.message || 'Gemini Service encountered a failure.' }, { status: 502 });
+      return NextResponse.json({ success: false, error: 'Something went wrong. Please try again.' }, { status: 502 });
     }
 
   } catch (error) {
     console.error('[Summarize API] Outer Router Error:', error);
     return NextResponse.json({
-      error: error instanceof Error ? error.message : 'Summarization critical failure',
+      success: false,
+      error: 'Something went wrong. Please try again.',
     }, { status: 500 });
   }
 }
+
