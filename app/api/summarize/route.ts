@@ -1,194 +1,246 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { PDFDocument } from 'pdf-lib';
 import JSZip from 'jszip';
-const pdf = require('pdf-parse');
 
 export const dynamic = 'force-dynamic';
-export const maxDuration = 120;
+export const maxDuration = 60;
 export const runtime = 'nodejs';
 
-const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB limit
+// ─── Constants ────────────────────────────────────────────────────────────────
+const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
 
-async function extractTextFromFile(fileBuffer: Buffer, mimeType: string, fileName: string): Promise<{ text: string | null; error?: string; details?: string }> {
-  try {
-    const ext = fileName.split('.').pop()?.toLowerCase() ?? '';
-    
-    // Lazy load pdf-parse inside the function to avoid top-level require issues
-    const pdf = require('pdf-parse');
+const SUPPORTED_EXTENSIONS = new Set(['pdf', 'docx', 'pptx', 'txt']);
 
-    // PDF
-    if (mimeType === 'application/pdf' || ext === 'pdf') {
-      try {
-        const data = await pdf(fileBuffer);
-        const text = data.text.trim().slice(0, 8000);
-        if (text.length > 50) return { text };
-        return { text: null, error: "Unable to read this file. Use a text-based document." };
-      } catch (err: any) {
-        console.error('[Summarize API] PDF Error:', err.message);
-        return { text: null, error: "Unable to read this file. Use a text-based document.", details: err.message };
-      }
-    }
+const SUPPORTED_MIME_TYPES = new Set([
+  'application/pdf',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'text/plain',
+]);
 
-    // DOCX
-    if (mimeType.includes('wordprocessingml') || ext === 'docx') {
-      try {
-        const zip = await JSZip.loadAsync(fileBuffer);
-        const docXml = zip.file('word/document.xml');
-        if (docXml) {
-          const xmlContent = await docXml.async('string');
-          const text = xmlContent
-            .replace(/<w:p[^>]*>/g, '\n')
-            .replace(/<[^>]+>/g, '')
-            .replace(/\s+/g, ' ')
-            .trim()
-            .slice(0, 8000);
-          if (text) return { text };
-        }
-      } catch (err: any) {
-        console.error('[Summarize API] DOCX Error:', err.message);
-      }
-      return { text: null, error: "Unable to read this file. Use a text-based document." };
-    }
-
-    // PPTX
-    if (mimeType.includes('presentationml') || ext === 'pptx') {
-      try {
-        const zip = await JSZip.loadAsync(fileBuffer);
-        let text = '';
-        const slideFiles = zip.file(/^ppt\/slides\/slide\d+\.xml$/);
-        for (const slideFile of slideFiles.slice(0, 20)) {
-          const xml = await slideFile.async('string');
-          const slideText = xml.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-          text += slideText + '\n';
-        }
-        if (text.trim()) return { text: text.slice(0, 8000) };
-      } catch (err: any) {
-        console.error('[Summarize API] PPTX Error:', err.message);
-      }
-      return { text: null, error: "Unable to read this file. Use a text-based document." };
-    }
-
-    // Plain text
-    if (mimeType === 'text/plain' || ext === 'txt') {
-      const text = fileBuffer.toString('utf-8').slice(0, 8000);
-      if (text.trim()) return { text: text.trim() };
-      return { text: null, error: "Unable to read this file. Use a text-based document." };
-    }
-
-    // Image
-    if (mimeType.startsWith('image/')) {
-      return { 
-        text: `[Image file: ${fileName}]. Please analyze the visual content and provide a summary of its purpose.` 
-      };
-    }
-
-    return { text: null, error: "Unable to read this file. Use a text-based document." };
-  } catch (criticalErr: any) {
-    console.error('[Summarize API] Extraction Critical Error:', criticalErr.message);
-    return { text: null, error: "Unable to read this file. Use a text-based document.", details: criticalErr.message };
-  }
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function getExtension(filename: string): string {
+  return filename.split('.').pop()?.toLowerCase() ?? '';
 }
 
-export async function POST(request: NextRequest) {
-  try {
-    const formData = await request.formData();
-    const file = formData.get('file') as File | null;
+function isSupportedFile(ext: string, mimeType: string): boolean {
+  return SUPPORTED_EXTENSIONS.has(ext) || SUPPORTED_MIME_TYPES.has(mimeType);
+}
 
-    if (!file) {
-      return NextResponse.json({ success: false, error: 'No file uploaded' }, { status: 400 });
+function jsonError(error: string, status: number): NextResponse {
+  return NextResponse.json({ success: false, error }, { status });
+}
+
+// ─── Text Extraction ──────────────────────────────────────────────────────────
+async function extractText(buffer: Buffer, ext: string, mimeType: string): Promise<string | null> {
+
+  // PDF extraction
+  if (ext === 'pdf' || mimeType === 'application/pdf') {
+    try {
+      // Dynamic require to prevent bundler issues with pdf-parse
+      const pdfParse = require('pdf-parse');
+      const result = await pdfParse(buffer);
+      const text = (result.text || '').trim();
+      return text.length > 30 ? text.slice(0, 8000) : null;
+    } catch (e: any) {
+      console.error('[Summarize] PDF parse error:', e.message);
+      return null;
     }
+  }
 
-    if (file.size > MAX_FILE_SIZE) {
-      return NextResponse.json({ success: false, error: 'File too large. Max 5MB' }, { status: 413 });
+  // DOCX extraction
+  if (ext === 'docx' || mimeType.includes('wordprocessingml')) {
+    try {
+      const zip = await JSZip.loadAsync(buffer);
+      const docFile = zip.file('word/document.xml');
+      if (!docFile) return null;
+      const xml = await docFile.async('string');
+      const text = xml
+        .replace(/<w:p[^>]*>/gi, '\n')
+        .replace(/<[^>]+>/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      return text.length > 30 ? text.slice(0, 8000) : null;
+    } catch (e: any) {
+      console.error('[Summarize] DOCX parse error:', e.message);
+      return null;
     }
+  }
 
-    const geminiKey = process.env.GEMINI_API_KEY;
-    console.log(`[Summarize API] Environment Check - GEMINI_API_KEY present: ${!!geminiKey}`);
-
-    if (!geminiKey) {
-      return NextResponse.json({ 
-        success: false, 
-        error: 'AI service temporarily unavailable',
-        details: 'GEMINI_API_KEY is missing from environment variables.'
-      }, { status: 500 });
+  // PPTX extraction
+  if (ext === 'pptx' || mimeType.includes('presentationml')) {
+    try {
+      const zip = await JSZip.loadAsync(buffer);
+      const slideFiles = zip.file(/^ppt\/slides\/slide\d+\.xml$/);
+      if (!slideFiles.length) return null;
+      let text = '';
+      for (const slide of slideFiles.slice(0, 25)) {
+        const xml = await slide.async('string');
+        text += xml.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() + '\n';
+      }
+      return text.trim().length > 30 ? text.trim().slice(0, 8000) : null;
+    } catch (e: any) {
+      console.error('[Summarize] PPTX parse error:', e.message);
+      return null;
     }
+  }
 
-    const mimeType = file.type;
-    const arrayBuffer = await file.arrayBuffer();
-    const fileBuffer = Buffer.from(arrayBuffer);
-
-    // Extract text content
-    const extraction = await extractTextFromFile(fileBuffer, mimeType, file.name || 'document');
-
-    if (extraction.error || !extraction.text) {
-      return NextResponse.json({ 
-        success: false, 
-        error: extraction.error || "Unable to read this file. Use a text-based document.",
-        details: extraction.details
-      }, { status: 422 });
+  // Plain text
+  if (ext === 'txt' || mimeType === 'text/plain') {
+    try {
+      const text = buffer.toString('utf-8').trim();
+      return text.length > 30 ? text.slice(0, 8000) : null;
+    } catch {
+      return null;
     }
+  }
 
-    const systemPrompt = `Analyze the document and return a JSON summary with fields: title, overview, keyPoints (array), and highlights (array of {label, value}). Focus on insights.`;
-    const userPrompt = `Document: "${file.name}"\n\nContent:\n${extraction.text.slice(0, 6000)}\n\nProvide summary.`;
+  return null;
+}
 
-    const models = ['gemini-1.5-flash', 'gemini-pro'];
-    let lastErrorDetails = '';
+// ─── Gemini API Call ──────────────────────────────────────────────────────────
+async function callGemini(text: string, fileName: string, apiKey: string): Promise<object | null> {
+  const prompt = `You are a document analyst. Read the following content from "${fileName}" and return a JSON summary with exactly these fields:
+{
+  "title": "A concise title for the document",
+  "overview": "2-3 sentence summary of the document",
+  "keyPoints": ["key insight 1", "key insight 2", "key insight 3"],
+  "highlights": [{"label": "Category", "value": "Key detail"}]
+}
+Respond with valid JSON only. No markdown, no code blocks.
 
-    for (const modelName of models) {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 25000);
+Document content:
+${text.slice(0, 5500)}`;
 
-      try {
-        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${geminiKey}`, {
+  // Try models in order of preference
+  const models = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro'];
+
+  for (const model of models) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 28000);
+
+    try {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+        {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            contents: [{ parts: [{ text: systemPrompt + "\n\n" + userPrompt }] }],
-            generationConfig: { response_mime_type: "application/json", temperature: 0.3 }
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: {
+              temperature: 0.2,
+              maxOutputTokens: 1024,
+            },
           }),
-          signal: controller.signal
-        });
-
-        clearTimeout(timeoutId);
-
-        if (!response.ok) {
-           const errBody = await response.text().catch(() => 'No error body');
-           console.warn(`[Summarize API] Model ${modelName} failed: ${response.status}`, errBody);
-           lastErrorDetails = `Model ${modelName} failed with status ${response.status}: ${errBody}`;
-           continue; 
+          signal: controller.signal,
         }
+      );
 
-        const responseData = await response.json();
-        const responseContent = responseData.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-        const summary = JSON.parse(responseContent);
+      clearTimeout(timeout);
 
-        return NextResponse.json({ success: true, data: summary });
-
-      } catch (apiError: any) {
-        clearTimeout(timeoutId);
-        console.error(`[Summarize API] API error with ${modelName}:`, apiError.name === 'AbortError' ? 'Timeout' : apiError.message);
-        lastErrorDetails = `Connection with ${modelName} failed: ${apiError.message}`;
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        console.warn(`[Summarize] Model ${model} HTTP ${res.status}:`, errText.slice(0, 200));
         continue;
       }
+
+      const body = await res.json();
+      const raw = body?.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+      
+      if (!raw) {
+        console.warn(`[Summarize] Empty response from ${model}`);
+        continue;
+      }
+
+      // Strip markdown code fences if present
+      const cleaned = raw.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+      const parsed = JSON.parse(cleaned);
+      
+      console.log(`[Summarize] Success with model: ${model}`);
+      return parsed;
+
+    } catch (e: any) {
+      clearTimeout(timeout);
+      const reason = e.name === 'AbortError' ? 'Timeout after 28s' : e.message;
+      console.warn(`[Summarize] Model ${model} error: ${reason}`);
+      continue;
     }
-
-    return NextResponse.json({ 
-      success: false, 
-      error: 'AI service temporarily unavailable',
-      details: lastErrorDetails || 'All Gemini models failed to respond.'
-    }, { status: 502 });
-
-  } catch (error: any) {
-    console.error('[Summarize API] Critical failure:', error.message);
-    return NextResponse.json({
-      success: false,
-      error: 'AI service temporarily unavailable',
-      details: `Critical crash: ${error.message}`
-    }, { status: 500 });
   }
+
+  return null;
 }
 
+// ─── Route Handler ────────────────────────────────────────────────────────────
+export async function POST(request: NextRequest): Promise<NextResponse> {
+  try {
+    // 1. Parse form data
+    let formData: FormData;
+    try {
+      formData = await request.formData();
+    } catch {
+      return jsonError('Invalid request format.', 400);
+    }
 
+    // 2. Validate file presence
+    const file = formData.get('file');
+    if (!file || !(file instanceof File)) {
+      return jsonError('No file uploaded.', 400);
+    }
 
+    // 3. Validate file size
+    if (file.size === 0) {
+      return jsonError('The uploaded file is empty.', 400);
+    }
+    if (file.size > MAX_FILE_SIZE) {
+      return jsonError('File too large. Maximum size is 5MB.', 413);
+    }
 
+    // 4. Validate file type
+    const ext = getExtension(file.name);
+    const mimeType = file.type || '';
+    
+    if (!isSupportedFile(ext, mimeType)) {
+      return jsonError('Unsupported file type. Please upload a PDF, DOCX, or PPTX file.', 415);
+    }
 
+    // 5. Check API key before processing
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      console.error('[Summarize] GEMINI_API_KEY not configured');
+      return jsonError('Unable to process document at the moment. Please try again.', 503);
+    }
+
+    // 6. Read file buffer
+    let buffer: Buffer;
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      buffer = Buffer.from(arrayBuffer);
+    } catch {
+      return jsonError('Failed to read the uploaded file. Please try again.', 422);
+    }
+
+    // 7. Extract text
+    console.log(`[Summarize] Processing: ${file.name} (${file.size} bytes, ext: ${ext})`);
+    const text = await extractText(buffer, ext, mimeType);
+
+    if (!text) {
+      return jsonError('Unable to extract readable text from this file. Please use a text-based PDF, DOCX, or PPTX.', 422);
+    }
+
+    console.log(`[Summarize] Extracted ${text.length} characters`);
+
+    // 8. Call Gemini
+    const summary = await callGemini(text, file.name, apiKey);
+
+    if (!summary) {
+      return jsonError('Unable to process document at the moment. Please try again.', 503);
+    }
+
+    // 9. Return success
+    return NextResponse.json({ success: true, data: summary });
+
+  } catch (e: any) {
+    // Top-level catch — should never hit in normal operation
+    console.error('[Summarize] Unhandled error:', e.message);
+    return jsonError('Unable to process document at the moment. Please try again.', 500);
+  }
+}

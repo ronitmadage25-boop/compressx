@@ -1,11 +1,10 @@
 'use client';
 // components/features/AISummarizer.tsx
-// AI Smart Summarizer — center feature with glow and typing animation
 
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Upload, Sparkles, RefreshCw, FileText, Star, ChevronRight } from 'lucide-react';
+import { Upload, Sparkles, RefreshCw, FileText, Star, ChevronRight, AlertCircle } from 'lucide-react';
 
 interface SummaryHighlight { label: string; value: string; }
 interface SummaryResult {
@@ -13,6 +12,14 @@ interface SummaryResult {
   overview: string;
   keyPoints: string[];
   highlights: SummaryHighlight[];
+}
+
+const MAX_SIZE_MB = 5;
+const MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024;
+const ACCEPTED_EXTENSIONS = new Set(['pdf', 'docx', 'pptx', 'txt']);
+
+function getExtension(name: string): string {
+  return name.split('.').pop()?.toLowerCase() ?? '';
 }
 
 function TypedText({ text, onDone }: { text: string; onDone?: () => void }) {
@@ -53,9 +60,20 @@ export default function AISummarizer() {
     setPortalTarget(document.getElementById('ai-summary-portal'));
   }, []);
 
+  const validateFile = (f: File): string | null => {
+    const ext = getExtension(f.name);
+    if (!ACCEPTED_EXTENSIONS.has(ext)) {
+      return `Unsupported file type (.${ext || 'unknown'}). Please upload PDF, DOCX, or PPTX.`;
+    }
+    if (f.size === 0) return 'This file is empty.';
+    if (f.size > MAX_SIZE_BYTES) return `File too large. Maximum size is ${MAX_SIZE_MB}MB.`;
+    return null;
+  };
+
   const handleFile = useCallback((f: File) => {
-    if (f.size > 5 * 1024 * 1024) {
-      setError("File too large. Max 5MB");
+    const validationError = validateFile(f);
+    if (validationError) {
+      setError(validationError);
       setFile(null);
       return;
     }
@@ -74,14 +92,11 @@ export default function AISummarizer() {
   }, [handleFile]);
 
   const handleSummarize = async () => {
-    if (!file) {
-      setError("No file uploaded");
-      return;
-    }
-    if (file.size > 5 * 1024 * 1024) {
-      setError("File too large. Max 5MB");
-      return;
-    }
+    if (!file) return;
+
+    // Re-validate before upload (safety net)
+    const validationError = validateFile(file);
+    if (validationError) { setError(validationError); return; }
 
     setIsLoading(true);
     setError(null);
@@ -93,41 +108,38 @@ export default function AISummarizer() {
       const formData = new FormData();
       formData.append('file', file);
 
-      await new Promise(r => setTimeout(r, 600));
+      await new Promise(r => setTimeout(r, 400));
       setPhase('thinking');
 
-      const res = await fetch('/api/summarize', { 
-        method: 'POST', 
+      const res = await fetch('/api/summarize', {
+        method: 'POST',
         body: formData,
-        headers: { 'Accept': 'application/json' }
       });
-      
-      const contentType = res.headers.get("content-type");
-      let data;
-      
-      if (contentType && contentType.includes("application/json")) {
+
+      // Always parse JSON — our API guarantees it
+      let data: any;
+      const contentType = res.headers.get('content-type') ?? '';
+      if (contentType.includes('application/json')) {
         data = await res.json();
+      } else {
+        // Unexpected non-JSON (CDN error, server crash) — treat as service error
+        const raw = await res.text().catch(() => '');
+        console.error('[AISummarizer] Non-JSON response:', raw.slice(0, 300));
+        throw new Error('Unable to process document at the moment. Please try again.');
       }
 
-      if (!res.ok) {
-        const msg = data?.error || `Server error (${res.status})`;
-        throw new Error(msg);
-      }
-
-      if (!data || !data.success) {
-        throw new Error(data?.error || 'Summarization failed');
+      if (!res.ok || !data?.success) {
+        throw new Error(data?.error ?? 'Unable to process document at the moment. Please try again.');
       }
 
       setSummary(data.data);
       setPhase('typing');
 
-      // Reveal points loop
       setTimeout(() => {
         const interval = setInterval(() => {
           setRevealedPoints(prev => {
             const next = prev + 1;
-            const pointsCount = data.data.keyPoints?.length ?? 0;
-            if (next >= pointsCount) {
+            if (next >= (data.data.keyPoints?.length ?? 0)) {
               clearInterval(interval);
               setPhase('done');
             }
@@ -137,16 +149,15 @@ export default function AISummarizer() {
       }, 1200);
 
       setTimeout(() => resultsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 200);
+
     } catch (err: any) {
-      console.error("[AISummarizer] Error:", err);
-      setError(err instanceof Error ? err.message : 'AI service temporarily unavailable');
+      console.error('[AISummarizer] Error:', err.message);
+      setError(err.message || 'Unable to process document at the moment. Please try again.');
       setPhase('idle');
     } finally {
       setIsLoading(false);
     }
   };
-
-
 
   const reset = () => {
     setFile(null);
@@ -156,7 +167,7 @@ export default function AISummarizer() {
     setRevealedPoints(0);
   };
 
-  const ACCEPTED = '.pdf,.docx,.pptx,.txt,.png,.jpg,.jpeg,.webp';
+  const ACCEPTED = '.pdf,.docx,.pptx,.txt';
 
   return (
     <>
@@ -212,10 +223,10 @@ export default function AISummarizer() {
               <motion.div key="empty" initial={{ opacity: 0 }} animate={{ opacity: 1 }} style={{ textAlign: 'center' }}>
                 <Upload size={24} style={{ color: 'var(--neon)', margin: '0 auto 0.6rem', opacity: 0.7 }} />
                 <div style={{ fontFamily: 'var(--font-mono)', fontSize: '0.7rem', color: 'var(--muted)' }}>
-                  Drop PDF, DOCX, PPTX, or Image
+                  Drop PDF, DOCX, or PPTX
                 </div>
                 <div style={{ fontFamily: 'var(--font-mono)', fontSize: '0.58rem', color: 'var(--muted)', opacity: 0.6, marginTop: '0.3rem' }}>
-                  Up to 20MB supported
+                  Max {MAX_SIZE_MB}MB · Text-based files only
                 </div>
               </motion.div>
             )}
@@ -237,13 +248,24 @@ export default function AISummarizer() {
                 transition={{ repeat: Infinity, duration: 0.8 }}
               />
               <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.65rem', color: 'var(--neon)' }}>
-                {phase === 'extracting' ? 'Extracting content…' : 'AI is thinking…'}
+                {phase === 'extracting' ? 'Reading document…' : 'AI is analyzing…'}
               </span>
             </motion.div>
           )}
         </AnimatePresence>
 
-        {error && <div className="feature-error">{error}</div>}
+        {/* Error Display */}
+        {error && (
+          <motion.div
+            initial={{ opacity: 0, y: -4 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="feature-error"
+            style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}
+          >
+            <AlertCircle size={14} style={{ flexShrink: 0 }} />
+            <span>{error}</span>
+          </motion.div>
+        )}
 
         {/* Summarize Button */}
         <motion.button
