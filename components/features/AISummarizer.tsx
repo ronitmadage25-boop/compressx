@@ -54,6 +54,11 @@ export default function AISummarizer() {
   }, []);
 
   const handleFile = useCallback((f: File) => {
+    if (f.size > 5 * 1024 * 1024) {
+      setError("File too large. Max 5MB");
+      setFile(null);
+      return;
+    }
     setFile(f);
     setSummary(null);
     setError(null);
@@ -69,43 +74,54 @@ export default function AISummarizer() {
   }, [handleFile]);
 
   const handleSummarize = async () => {
-    if (!file) return;
+    if (!file) {
+      setError("No file uploaded");
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      setError("File too large. Max 5MB");
+      return;
+    }
+
     setIsLoading(true);
     setError(null);
     setSummary(null);
     setRevealedPoints(0);
     setPhase('extracting');
 
-    const formData = new FormData();
-    formData.append('file', file);
-
     try {
+      const formData = new FormData();
+      formData.append('file', file);
+
       await new Promise(r => setTimeout(r, 600));
       setPhase('thinking');
 
-      const res = await fetch('/api/summarize', { method: 'POST', body: formData });
+      const res = await fetch('/api/summarize', { 
+        method: 'POST', 
+        body: formData,
+        headers: { 'Accept': 'application/json' }
+      });
       
-      // Safety check: ensure response is JSON
       const contentType = res.headers.get("content-type");
-      console.log(`[AISummarizer] Status: ${res.status}, Type: ${contentType}`);
-
-      if (!contentType || !contentType.includes("application/json")) {
-        const text = await res.text();
-        console.error("[AISummarizer] Non-JSON response:", text.slice(0, 500));
-        throw new Error("Server error, try again.");
+      let data;
+      
+      if (contentType && contentType.includes("application/json")) {
+        data = await res.json();
       }
 
-      const data = await res.json();
+      if (!res.ok) {
+        const msg = data?.error || `Server error (${res.status})`;
+        throw new Error(msg);
+      }
 
-      if (!data.success) {
-        console.warn("[AISummarizer] API Error:", data.error);
-        throw new Error(data.error || 'Summarization failed');
+      if (!data || !data.success) {
+        throw new Error(data?.error || 'Summarization failed');
       }
 
       setSummary(data.data);
       setPhase('typing');
 
-      // After title types out, reveal key points one by one
+      // Reveal points loop
       setTimeout(() => {
         const interval = setInterval(() => {
           setRevealedPoints(prev => {
@@ -123,13 +139,13 @@ export default function AISummarizer() {
       setTimeout(() => resultsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 200);
     } catch (err) {
       console.error("[AISummarizer] Error:", err);
-      setError(err instanceof Error ? err.message : 'Summarization failed');
+      setError(err instanceof Error ? err.message : 'AI service temporarily unavailable');
       setPhase('idle');
     } finally {
       setIsLoading(false);
     }
-
   };
+
 
   const reset = () => {
     setFile(null);
