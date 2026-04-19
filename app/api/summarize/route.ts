@@ -137,39 +137,54 @@ Be concise, professional, and focus on the most important information.`;
 
     const userPrompt = `Document: "${file.name}"\n\nContent:\n${extraction.text.slice(0, 6000)}\n\nProvide a structured JSON summary.`;
 
-    try {
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash:generateContent?key=${geminiKey}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: systemPrompt + "\n\n" + userPrompt }] }],
-          generationConfig: { response_mime_type: "application/json", temperature: 0.3 }
-        })
-      });
+    const models = ['gemini-3-flash', 'gemini-1.5-flash', 'gemini-pro'];
+    let lastError = 'Server error, try again.';
 
-      if (!response.ok) {
-        const errorData = await response.text();
-        console.error('[Summarize API] Gemini Service Error:', response.status, errorData);
-        let msg = 'Server error, try again.';
-        if (response.status === 400 && errorData.includes('API key not valid')) msg = 'Invalid configuration, try again later.';
-        return NextResponse.json({ success: false, error: msg }, { status: 502 });
+    for (const modelName of models) {
+      try {
+        console.log(`[Summarize API] Attempting model: ${modelName}`);
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${geminiKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: systemPrompt + "\n\n" + userPrompt }] }],
+            generationConfig: { response_mime_type: "application/json", temperature: 0.3 }
+          }),
+          signal: AbortSignal.timeout(30000) // 30s timeout
+        });
+
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+          const errorMsg = errorData.error?.message || response.statusText;
+          console.warn(`[Summarize API] Model ${modelName} failed:`, response.status, errorMsg);
+          
+          if (response.status === 400 && errorMsg.includes('API key not valid')) {
+             return NextResponse.json({ success: false, error: 'Invalid Gemini API Key. Please verify .env.local.' }, { status: 401 });
+          }
+          
+          lastError = `Gemini Error (${modelName}): ${errorMsg}`;
+          continue; // Try next model
+        }
+
+        const responseData = await response.json();
+        const responseContent = responseData.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+        const summary = JSON.parse(responseContent);
+
+        console.log(`[Summarize API] Success with ${modelName}`);
+        return NextResponse.json({
+          success: true,
+          fileName: file.name,
+          data: summary,
+        });
+
+      } catch (apiError: any) {
+        console.error(`[Summarize API] Connection error with ${modelName}:`, apiError.message);
+        lastError = `Connection Error: ${apiError.message}`;
+        continue;
       }
-
-      const responseData = await response.json();
-      const responseContent = responseData.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-      const summary = JSON.parse(responseContent);
-
-      console.log(`[Summarize API] Success: ${file.name}`);
-      return NextResponse.json({
-        success: true,
-        fileName: file.name,
-        data: summary,
-      });
-
-    } catch (apiError: any) {
-      console.error('[Summarize API] Gemini Connection Error:', apiError);
-      return NextResponse.json({ success: false, error: 'Server error, try again.' }, { status: 502 });
     }
+
+    return NextResponse.json({ success: false, error: lastError }, { status: 502 });
 
   } catch (error) {
     console.error('[Summarize API] Critical Failure:', error);
@@ -179,5 +194,6 @@ Be concise, professional, and focus on the most important information.`;
     }, { status: 500 });
   }
 }
+
 
 
