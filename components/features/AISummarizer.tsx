@@ -137,7 +137,7 @@ export default function AISummarizer() {
       }, 1200);
 
       setTimeout(() => resultsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 200);
-    } catch (err) {
+    } catch (err: any) {
       console.error("[AISummarizer] Error:", err);
       setError(err instanceof Error ? err.message : 'AI service temporarily unavailable');
       setPhase('idle');
@@ -145,6 +145,7 @@ export default function AISummarizer() {
       setIsLoading(false);
     }
   };
+
 
 
   const reset = () => {

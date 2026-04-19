@@ -9,9 +9,12 @@ export const runtime = 'nodejs';
 
 const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB limit
 
-async function extractTextFromFile(fileBuffer: Buffer, mimeType: string, fileName: string): Promise<{ text: string | null; error?: string }> {
+async function extractTextFromFile(fileBuffer: Buffer, mimeType: string, fileName: string): Promise<{ text: string | null; error?: string; details?: string }> {
   try {
     const ext = fileName.split('.').pop()?.toLowerCase() ?? '';
+    
+    // Lazy load pdf-parse inside the function to avoid top-level require issues
+    const pdf = require('pdf-parse');
 
     // PDF
     if (mimeType === 'application/pdf' || ext === 'pdf') {
@@ -20,9 +23,9 @@ async function extractTextFromFile(fileBuffer: Buffer, mimeType: string, fileNam
         const text = data.text.trim().slice(0, 8000);
         if (text.length > 50) return { text };
         return { text: null, error: "Unable to read this file. Use a text-based document." };
-      } catch (err) {
-        console.error('[Summarize API] PDF Extraction Error:', err);
-        return { text: null, error: "Unable to read this file. Use a text-based document." };
+      } catch (err: any) {
+        console.error('[Summarize API] PDF Error:', err.message);
+        return { text: null, error: "Unable to read this file. Use a text-based document.", details: err.message };
       }
     }
 
@@ -41,8 +44,8 @@ async function extractTextFromFile(fileBuffer: Buffer, mimeType: string, fileNam
             .slice(0, 8000);
           if (text) return { text };
         }
-      } catch (err) {
-        console.error('[Summarize API] DOCX Error:', err);
+      } catch (err: any) {
+        console.error('[Summarize API] DOCX Error:', err.message);
       }
       return { text: null, error: "Unable to read this file. Use a text-based document." };
     }
@@ -59,8 +62,8 @@ async function extractTextFromFile(fileBuffer: Buffer, mimeType: string, fileNam
           text += slideText + '\n';
         }
         if (text.trim()) return { text: text.slice(0, 8000) };
-      } catch (err) {
-        console.error('[Summarize API] PPTX Error:', err);
+      } catch (err: any) {
+        console.error('[Summarize API] PPTX Error:', err.message);
       }
       return { text: null, error: "Unable to read this file. Use a text-based document." };
     }
@@ -80,9 +83,9 @@ async function extractTextFromFile(fileBuffer: Buffer, mimeType: string, fileNam
     }
 
     return { text: null, error: "Unable to read this file. Use a text-based document." };
-  } catch (criticalErr) {
-    console.error('[Summarize API] Extraction Critical Error:', criticalErr);
-    return { text: null, error: "Unable to read this file. Use a text-based document." };
+  } catch (criticalErr: any) {
+    console.error('[Summarize API] Extraction Critical Error:', criticalErr.message);
+    return { text: null, error: "Unable to read this file. Use a text-based document.", details: criticalErr.message };
   }
 }
 
@@ -100,28 +103,41 @@ export async function POST(request: NextRequest) {
     }
 
     const geminiKey = process.env.GEMINI_API_KEY;
+    console.log(`[Summarize API] Environment Check - GEMINI_API_KEY present: ${!!geminiKey}`);
+
     if (!geminiKey) {
-      console.error('[Summarize API] GEMINI_API_KEY missing');
-      return NextResponse.json({ success: false, error: 'AI service temporarily unavailable' }, { status: 500 });
+      return NextResponse.json({ 
+        success: false, 
+        error: 'AI service temporarily unavailable',
+        details: 'GEMINI_API_KEY is missing from environment variables.'
+      }, { status: 500 });
     }
 
     const mimeType = file.type;
-    const fileBuffer = Buffer.from(await file.arrayBuffer());
+    const arrayBuffer = await file.arrayBuffer();
+    const fileBuffer = Buffer.from(arrayBuffer);
 
     // Extract text content
     const extraction = await extractTextFromFile(fileBuffer, mimeType, file.name || 'document');
 
     if (extraction.error || !extraction.text) {
-      return NextResponse.json({ success: false, error: extraction.error || "Unable to read this file. Use a text-based document." }, { status: 422 });
+      return NextResponse.json({ 
+        success: false, 
+        error: extraction.error || "Unable to read this file. Use a text-based document.",
+        details: extraction.details
+      }, { status: 422 });
     }
 
     const systemPrompt = `Analyze the document and return a JSON summary with fields: title, overview, keyPoints (array), and highlights (array of {label, value}). Focus on insights.`;
     const userPrompt = `Document: "${file.name}"\n\nContent:\n${extraction.text.slice(0, 6000)}\n\nProvide summary.`;
 
     const models = ['gemini-1.5-flash', 'gemini-pro'];
-    let lastError = 'AI service temporarily unavailable';
+    let lastErrorDetails = '';
 
     for (const modelName of models) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 25000);
+
       try {
         const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${geminiKey}`, {
           method: 'POST',
@@ -130,11 +146,15 @@ export async function POST(request: NextRequest) {
             contents: [{ parts: [{ text: systemPrompt + "\n\n" + userPrompt }] }],
             generationConfig: { response_mime_type: "application/json", temperature: 0.3 }
           }),
-          signal: AbortSignal.timeout(25000) // 25s timeout for Gemini
+          signal: controller.signal
         });
 
+        clearTimeout(timeoutId);
+
         if (!response.ok) {
-           console.warn(`[Summarize API] Model ${modelName} failed`);
+           const errBody = await response.text().catch(() => 'No error body');
+           console.warn(`[Summarize API] Model ${modelName} failed: ${response.status}`, errBody);
+           lastErrorDetails = `Model ${modelName} failed with status ${response.status}: ${errBody}`;
            continue; 
         }
 
@@ -142,27 +162,32 @@ export async function POST(request: NextRequest) {
         const responseContent = responseData.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
         const summary = JSON.parse(responseContent);
 
-        return NextResponse.json({
-          success: true,
-          data: summary,
-        });
+        return NextResponse.json({ success: true, data: summary });
 
       } catch (apiError: any) {
-        console.error(`[Summarize API] API error with ${modelName}:`, apiError.message);
+        clearTimeout(timeoutId);
+        console.error(`[Summarize API] API error with ${modelName}:`, apiError.name === 'AbortError' ? 'Timeout' : apiError.message);
+        lastErrorDetails = `Connection with ${modelName} failed: ${apiError.message}`;
         continue;
       }
     }
 
-    return NextResponse.json({ success: false, error: 'AI service temporarily unavailable' }, { status: 502 });
+    return NextResponse.json({ 
+      success: false, 
+      error: 'AI service temporarily unavailable',
+      details: lastErrorDetails || 'All Gemini models failed to respond.'
+    }, { status: 502 });
 
-  } catch (error) {
-    console.error('[Summarize API] Critical failure:', error);
+  } catch (error: any) {
+    console.error('[Summarize API] Critical failure:', error.message);
     return NextResponse.json({
       success: false,
       error: 'AI service temporarily unavailable',
+      details: `Critical crash: ${error.message}`
     }, { status: 500 });
   }
 }
+
 
 
 
