@@ -1,11 +1,12 @@
-// Service Worker for CompressX PWA
-const CACHE_NAME = 'compressx-v1';
+// Service Worker for CompressX PWA - Enhanced for proper install behavior
+const CACHE_NAME = 'compressx-v2';
 const ASSETS_TO_CACHE = [
   '/',
-  '/index.html',
   '/manifest.json',
-  '/logo-192.png',
-  '/logo-512.png',
+  '/logo-192.svg',
+  '/logo-512.svg',
+  '/logo-192-maskable.svg',
+  '/logo-512-maskable.svg'
 ];
 
 // Install event - cache assets
@@ -21,25 +22,37 @@ self.addEventListener('install', (event) => {
       });
     })
   );
+  // Force immediate activation
   self.skipWaiting();
 });
 
-// Activate event - clean up old caches
+// Activate event - clean up old caches and claim clients
 self.addEventListener('activate', (event) => {
   console.log('[Service Worker] Activating...');
   event.waitUntil(
-    caches.keys().then((cacheNames) => {
-      return Promise.all(
-        cacheNames.map((cacheName) => {
-          if (cacheName !== CACHE_NAME) {
-            console.log('[Service Worker] Deleting old cache:', cacheName);
-            return caches.delete(cacheName);
-          }
-        })
-      );
-    })
+    Promise.all([
+      // Clean up old caches
+      caches.keys().then((cacheNames) => {
+        return Promise.all(
+          cacheNames.map((cacheName) => {
+            if (cacheName !== CACHE_NAME) {
+              console.log('[Service Worker] Deleting old cache:', cacheName);
+              return caches.delete(cacheName);
+            }
+          })
+        );
+      }),
+      // Claim all clients immediately
+      self.clients.claim()
+    ])
   );
-  self.clients.claim();
+  
+  // Notify all clients that SW is ready
+  self.clients.matchAll().then(clients => {
+    clients.forEach(client => {
+      client.postMessage({ type: 'SW_ACTIVATED' });
+    });
+  });
 });
 
 // Fetch event - serve from cache, fallback to network

@@ -1,6 +1,6 @@
 'use client';
 // components/features/PDFPageShuffle.tsx
-// PDF Page Shuffle Tool — drag and reorder pages
+// PDF Page Shuffle Tool — drag and reorder pages (OPTIMIZED)
 
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -43,7 +43,7 @@ async function loadPdfJs(): Promise<any> {
   });
 }
 
-async function renderPageThumb(pdfPage: any, scale = 0.3): Promise<string> {
+async function renderPageThumb(pdfPage: any, scale = 0.2): Promise<string> {
   const viewport = pdfPage.getViewport({ scale });
   const canvas = document.createElement('canvas');
   canvas.width = viewport.width;
@@ -54,7 +54,7 @@ async function renderPageThumb(pdfPage: any, scale = 0.3): Promise<string> {
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
   await pdfPage.render({ canvasContext: ctx, viewport }).promise;
-  return canvas.toDataURL('image/jpeg', 0.7);
+  return canvas.toDataURL('image/jpeg', 0.6); // Lower quality for faster processing
 }
 
 export default function PDFPageShuffle() {
@@ -68,11 +68,18 @@ export default function PDFPageShuffle() {
   const [error, setError] = useState<string | null>(null);
   const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const handleFile = useCallback(async (f: File) => {
     const ext = f.name.split('.').pop()?.toLowerCase();
     if (ext !== 'pdf' && f.type !== 'application/pdf') {
       setError('Only PDF files are supported');
+      return;
+    }
+
+    // Check file size (limit to 10MB for performance)
+    if (f.size > 10 * 1024 * 1024) {
+      setError('File too large. Maximum size is 10MB for page shuffling.');
       return;
     }
 
@@ -83,25 +90,61 @@ export default function PDFPageShuffle() {
     setIsLoading(true);
     setLoadProgress(0);
 
+    // Cancel any previous loading
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    abortControllerRef.current = new AbortController();
+
     try {
       const pdfjs = await loadPdfJs();
       const arrayBuffer = await f.arrayBuffer();
       const pdfDoc = await pdfjs.getDocument({ data: arrayBuffer }).promise;
       const numPages = pdfDoc.numPages;
 
+      // Limit pages for performance (max 50 pages)
+      if (numPages > 50) {
+        setError('PDF has too many pages. Maximum 50 pages supported for shuffling.');
+        return;
+      }
+
       const thumbs: PageThumb[] = [];
-      for (let i = 1; i <= numPages; i++) {
-        const page = await pdfDoc.getPage(i);
-        const dataUrl = await renderPageThumb(page, 0.25);
-        thumbs.push({ index: i - 1, dataUrl });
-        setLoadProgress(Math.round((i / numPages) * 100));
+      
+      // Process pages in batches to avoid blocking UI
+      const batchSize = 3;
+      for (let i = 1; i <= numPages; i += batchSize) {
+        if (abortControllerRef.current?.signal.aborted) {
+          throw new Error('Operation cancelled');
+        }
+
+        const batchPromises = [];
+        for (let j = i; j < Math.min(i + batchSize, numPages + 1); j++) {
+          batchPromises.push(
+            pdfDoc.getPage(j).then(async (page: any) => {
+              const dataUrl = await renderPageThumb(page, 0.15); // Smaller scale for speed
+              return { index: j - 1, dataUrl };
+            })
+          );
+        }
+
+        const batchResults = await Promise.all(batchPromises);
+        thumbs.push(...batchResults);
+        
+        setLoadProgress(Math.round((thumbs.length / numPages) * 100));
         setPages([...thumbs]);
+
+        // Small delay to prevent UI blocking
+        await new Promise(resolve => setTimeout(resolve, 10));
       }
     } catch (err) {
+      if (err instanceof Error && err.message === 'Operation cancelled') {
+        return; // Don't show error for cancelled operations
+      }
       setError(err instanceof Error ? err.message : 'Failed to load PDF');
     } finally {
       setIsLoading(false);
       setLoadProgress(0);
+      abortControllerRef.current = null;
     }
   }, []);
 
@@ -132,27 +175,29 @@ export default function PDFPageShuffle() {
     setError(null);
 
     try {
-      const formData = new FormData();
-      formData.append('file', file);
-      formData.append('pageOrder', JSON.stringify(pages.map(p => p.index)));
-
-      const res = await fetch('/api/pdf-pages', { 
-        method: 'POST', 
-        body: formData,
-        signal: AbortSignal.timeout(120000) // 2 minute timeout
-      });
+      // Use client-side processing instead of API for better reliability
+      const pdfjs = await loadPdfJs();
+      const { PDFDocument } = await import('pdf-lib');
       
-      if (!res.ok) {
-        throw new Error(`HTTP error! status: ${res.status}`);
+      const arrayBuffer = await file.arrayBuffer();
+      const srcPdf = await PDFDocument.load(arrayBuffer, { ignoreEncryption: true });
+      const newPdf = await PDFDocument.create();
+
+      // Copy pages in the new order
+      for (const page of pages) {
+        const [copiedPage] = await newPdf.copyPages(srcPdf, [page.index]);
+        newPdf.addPage(copiedPage);
       }
-      
-      const data = await res.json();
 
-      if (!data.success) throw new Error(data.error ?? 'Failed to reorder PDF');
+      const pdfBytes = await newPdf.save();
+      const blob = new Blob([new Uint8Array(pdfBytes)], { type: 'application/pdf' });
+      const url = URL.createObjectURL(blob);
+      const newName = file.name.replace(/\.pdf$/i, '_shuffled.pdf');
 
-      setResult({ url: data.downloadUrl, name: data.fileName });
+      setResult({ url, name: newName });
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to reorder pages');
+      console.error('[PDFShuffle] Error:', err);
+      setError('Unable to process PDF. Please try again with a different file.');
     } finally {
       setIsProcessing(false);
     }
@@ -163,10 +208,25 @@ export default function PDFPageShuffle() {
     const a = document.createElement('a');
     a.href = result.url;
     a.download = result.name;
+    document.body.appendChild(a);
     a.click();
+    document.body.removeChild(a);
+    
+    // Clean up blob URL
+    setTimeout(() => URL.revokeObjectURL(result.url), 1000);
   };
 
   const reset = () => {
+    // Cancel any ongoing loading
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    
+    // Clean up blob URL
+    if (result?.url) {
+      URL.revokeObjectURL(result.url);
+    }
+    
     setFile(null);
     setPages([]);
     setResult(null);
@@ -182,6 +242,18 @@ export default function PDFPageShuffle() {
     const f = e.dataTransfer.files[0];
     if (f) handleFile(f);
   }, [handleFile]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+      if (result?.url) {
+        URL.revokeObjectURL(result.url);
+      }
+    };
+  }, [result?.url]);
 
   return (
     <div className="feature-card glass-card">
@@ -244,7 +316,7 @@ export default function PDFPageShuffle() {
                   Drop a PDF to shuffle pages
                 </div>
                 <div style={{ fontFamily: 'var(--font-mono)', fontSize: '0.58rem', marginTop: '0.25rem', opacity: 0.6 }}>
-                  Drag thumbnails to reorder
+                  Max 10MB, 50 pages
                 </div>
               </div>
             </div>
@@ -321,7 +393,7 @@ export default function PDFPageShuffle() {
                 style={{ marginTop: '0.75rem' }}
               >
                 {isProcessing ? (
-                  <><motion.div animate={{ rotate: 360 }} transition={{ repeat: Infinity, duration: 0.8 }}><RefreshCw size={14} /></motion.div> Applying…</>
+                  <><motion.div animate={{ rotate: 360 }} transition={{ repeat: Infinity, duration: 0.8 }}><RefreshCw size={14} /></motion.div> Processing…</>
                 ) : (
                   <><Shuffle size={14} /> Apply Changes</>
                 )}

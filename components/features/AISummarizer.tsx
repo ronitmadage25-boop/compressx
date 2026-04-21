@@ -237,7 +237,7 @@ export default function AISummarizer() {
             <div className="feature-card-title text-gradient-glow" style={{ fontSize: '1.05rem' }}>
               AI Smart Summarizer
             </div>
-            <div className="feature-card-sub">Powered by Gemini AI — Instant insights</div>
+            <div className="feature-card-sub">AI-powered document analysis</div>
           </div>
         </div>
 
