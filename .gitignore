@@ -29,3 +29,5 @@ Thumbs.db
 
 # Temp compression files
 /tmp/compressx/
+.env.local
+.env
